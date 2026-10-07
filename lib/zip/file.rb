@@ -201,6 +201,26 @@ module Zip
           zf.extract_all(destination_directory, &block)
         end
       end
+
+      # Opens the archive at +path+ as it was at the revision described by
+      # +receipt+ (a Zip::AppendCommit::Receipt returned by #commit_append
+      # or AppendCommit.current_receipt), reading the central directory at
+      # the position recorded in the receipt rather than the latest one.
+      #
+      # This is how historical revisions of an append-committed archive are
+      # read: entries that were later removed or replaced are still visible
+      # here, because append commits never touch old revisions' bytes.
+      def open_revision(path, receipt)
+        zf = allocate
+        zf.send(:initialize_for_revision, path, receipt)
+        return zf unless block_given?
+
+        begin
+          yield zf
+        ensure
+          zf.close
+        end
+      end
     end
 
     # Returns an input stream to the specified entry. If a block is passed
@@ -411,6 +431,42 @@ module Zip
       initialize_cdir(@name)
     end
 
+    # Commits changes by appending a new revision to the end of the
+    # archive, instead of rewriting the whole file like #commit does.
+    #
+    # Only new and changed entries are written out; unchanged entries keep
+    # referencing their existing local records and are neither read nor
+    # recompressed. A new central directory and end record are appended
+    # after them, so normal readers see the latest revision.
+    #
+    # Returns a Zip::AppendCommit::Receipt recording where this revision's
+    # directory lives; keep it to reopen exactly this revision later with
+    # Zip::File.open_revision. Returns nil when there was nothing to commit.
+    #
+    # Note that removing or replacing an entry only affects the new
+    # directory: the old entry bytes remain in the file and stay readable
+    # through older revisions' receipts. Append commits are therefore NOT a
+    # secure deletion mechanism - use #commit (a full rewrite) when removed
+    # data must actually be gone from the file.
+    #
+    # Crash safety: the revision is journaled (see Zip::AppendCommit). If
+    # the process dies mid-commit, the next append commit (or an explicit
+    # Zip::AppendCommit.recover) returns the file to its last confirmed
+    # length before proceeding.
+    def commit_append
+      unless @name.kind_of?(String)
+        raise Error, 'append commit requires an archive path, not a buffer'
+      end
+      return unless commit_required?
+
+      receipt = ::Zip::AppendCommit.commit(
+        @name, @cdir, suppress_extra_fields: @suppress_extra_fields
+      )
+      @cdir.each(&:clean_up)
+      initialize_cdir(@name)
+      receipt
+    end
+
     # Write buffer write changes to buffer and return
     def write_buffer(io = ::StringIO.new)
       return io unless commit_required?
@@ -560,6 +616,25 @@ module Zip
 
     def check_file(path)
       raise Errno::ENOENT, path unless ::File.readable?(path)
+    end
+
+    # Initializes the archive object for a historical revision, reading the
+    # central directory at the position recorded in +receipt+.
+    def initialize_for_revision(path, receipt)
+      @name = path
+      @create = false
+      @restore_ownership     = DEFAULT_RESTORE_OPTIONS[:restore_ownership]
+      @restore_permissions   = DEFAULT_RESTORE_OPTIONS[:restore_permissions]
+      @restore_times         = DEFAULT_RESTORE_OPTIONS[:restore_times]
+      @compression_level     = ::Zip.default_compression
+      @suppress_extra_fields = false
+      @file_permissions      = ::File.stat(path).mode
+
+      receipt.validate_present!
+      @cdir = ::Zip::CentralDirectory.new
+      ::File.open(path, 'rb') do |f|
+        @cdir.read_entries_at(f, receipt.cdir_offset, receipt.entry_count)
+      end
     end
 
     def on_success_replace
