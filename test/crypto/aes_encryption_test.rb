@@ -51,6 +51,37 @@ class AESEncrypterTest < Minitest::Test
     @password = 'password'
   end
 
+  FixedRandom = Struct.new(:salt) do
+    def random_bytes(length)
+      raise "expected #{salt.bytesize} bytes, got #{length}" unless length == salt.bytesize
+
+      salt.dup
+    end
+  end
+
+  # These values were generated independently with Python's cryptography
+  # package and OpenSSL's PBKDF2-HMAC-SHA1 implementation.
+  FIXED_VECTORS = {
+    Zip::AESEncryption::STRENGTH_128_BIT => {
+      salt:       ['0102030405060708'].pack('H*'),
+      verifier:   ['882f'].pack('H*'),
+      ciphertext: ['1bc2b4e246cc37907ec93ef359994510'].pack('H*'),
+      auth_code:  ['effea3b1877ff0c88b27'].pack('H*')
+    },
+    Zip::AESEncryption::STRENGTH_192_BIT => {
+      salt:       ['0102030405060708090a0b0c'].pack('H*'),
+      verifier:   ['cf73'].pack('H*'),
+      ciphertext: ['f56e05e2a109220df07528e213456f51'].pack('H*'),
+      auth_code:  ['8a6c973137c1dba99ae5'].pack('H*')
+    },
+    Zip::AESEncryption::STRENGTH_256_BIT => {
+      salt:       ['0102030405060708090a0b0c0d0e0f10'].pack('H*'),
+      verifier:   ['4738'].pack('H*'),
+      ciphertext: ['3e247f9c43a5f181740c88b86ca65448'].pack('H*'),
+      auth_code:  ['93a201a846da5e1e03c8'].pack('H*')
+    }
+  }.freeze
+
   def test_header_bytesize
     encrypter = Zip::AESEncrypter.new(@password, Zip::AESEncryption::STRENGTH_256_BIT)
     encrypter.reset!
@@ -79,6 +110,45 @@ class AESEncrypterTest < Minitest::Test
     second_header = encrypter.header('ignored')
 
     refute_equal first_header, second_header
+  end
+
+  def test_encrypts_known_vectors_with_an_injected_random_source
+    plaintext = 'AES fixed vector'
+
+    FIXED_VECTORS.each do |strength, vector|
+      encrypter = Zip::AESEncrypter.new(
+        @password, strength, random: FixedRandom.new(vector[:salt])
+      )
+      encrypter.reset!
+
+      assert_equal vector[:salt] + vector[:verifier], encrypter.header('ignored')
+      assert_equal vector[:ciphertext] + vector[:auth_code],
+                   encrypter.encrypt(plaintext) + encrypter.trailer
+    end
+  end
+
+  def test_rejects_a_random_source_that_returns_too_few_bytes
+    random = Object.new
+    def random.random_bytes(_length)
+      'x'
+    end
+
+    encrypter = Zip::AESEncrypter.new(
+      @password, Zip::AESEncryption::STRENGTH_128_BIT, random: random
+    )
+    error = assert_raises(Zip::Error) { encrypter.reset! }
+
+    assert_equal 'Random source returned 1 bytes, expected 8', error.message
+    refute_includes error.message, @password
+  end
+
+  def test_rejects_unsupported_strengths_without_exposing_the_password
+    error = assert_raises(Zip::Error) do
+      Zip::AESEncrypter.new(@password, 99)
+    end
+
+    assert_equal 'Unsupported encryption AES strength 99', error.message
+    refute_includes error.message, @password
   end
 
   # `trailer` returns whatever ciphertext was still buffered (a final,
@@ -164,5 +234,32 @@ class AESEncrypterTest < Minitest::Test
     decrypter.decrypt(tampered)
     error = assert_raises(Zip::Error) { decrypter.check_integrity!(StringIO.new(auth_code)) }
     assert_equal 'Integrity fault', error.message
+  end
+
+  def test_empty_ciphertext_still_checks_the_authentication_code
+    STRENGTHS.each do |strength|
+      encrypter = Zip::AESEncrypter.new(@password, strength)
+      encrypter.reset!
+      header = encrypter.header('ignored')
+      auth_code = encrypter.trailer
+
+      decrypter = Zip::AESDecrypter.new(@password, strength)
+      decrypter.reset!(header)
+      decrypter.check_integrity!(StringIO.new(auth_code))
+    end
+  end
+
+  def test_empty_ciphertext_rejects_a_tampered_authentication_code
+    encrypter = Zip::AESEncrypter.new(@password, Zip::AESEncryption::STRENGTH_256_BIT)
+    encrypter.reset!
+    header = encrypter.header('ignored')
+    auth_code = encrypter.trailer
+    auth_code.setbyte(-1, auth_code.getbyte(-1) ^ 0xff)
+
+    decrypter = Zip::AESDecrypter.new(@password, Zip::AESEncryption::STRENGTH_256_BIT)
+    decrypter.reset!(header)
+    assert_raises(Zip::Error) do
+      decrypter.check_integrity!(StringIO.new(auth_code))
+    end
   end
 end

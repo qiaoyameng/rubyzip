@@ -45,6 +45,7 @@ module Zip
       @encrypter = encrypter || ::Zip::NullEncrypter.new
       @suppress_extra_fields = suppress_extra_fields
       @closed = false
+      @failed = false
       @current_entry = nil
     end
 
@@ -82,10 +83,11 @@ module Zip
     # Closes the stream and writes the central directory to the zip file
     def close
       return if @closed
+      raise Error, 'cannot close a zip stream after a write error' if @failed
 
       finalize_current_entry
       update_local_headers
-      @cdir.write_to_stream(@output_stream, suppress_extra_fields: @suppress_extra_fields)
+      write_central_directory
       @output_stream.close
       @closed = true
     end
@@ -93,10 +95,11 @@ module Zip
     # Closes the stream and writes the central directory to the zip file
     def close_buffer
       return @output_stream if @closed
+      raise Error, 'cannot close a zip stream after a write error' if @failed
 
       finalize_current_entry
       update_local_headers
-      @cdir.write_to_stream(@output_stream, suppress_extra_fields: @suppress_extra_fields)
+      write_central_directory
       @closed = true
       @output_stream.flush
       @output_stream
@@ -153,32 +156,42 @@ module Zip
     def finalize_current_entry
       return unless @current_entry
 
-      finish
-      @output_stream << @encrypter.trailer unless @current_entry.directory?
-      @current_entry.compressed_size = @output_stream.tell -
-                                       @current_entry.local_header_offset -
-                                       @current_entry.calculate_local_header_size
-      @current_entry.size = @compressor.size
-      @current_entry.crc = @encrypter.crc(@compressor.crc)
-      @output_stream << @encrypter.data_descriptor(
-        @current_entry.crc,
-        @current_entry.compressed_size,
-        @current_entry.size
-      )
-      @current_entry.gp_flags |= @encrypter.gp_flags unless @current_entry.directory?
-      @current_entry = nil
-      @compressor = ::Zip::NullCompressor.instance
+      begin
+        finish
+        @output_stream << @encrypter.trailer unless @current_entry.directory?
+        @current_entry.compressed_size = @output_stream.tell -
+                                         @current_entry.local_header_offset -
+                                         @current_entry.calculate_local_header_size
+        @current_entry.size = @compressor.size
+        @current_entry.crc = @encrypter.crc(@compressor.crc)
+        @output_stream << @encrypter.data_descriptor(
+          @current_entry.crc,
+          @current_entry.compressed_size,
+          @current_entry.size
+        )
+        @current_entry.gp_flags |= @encrypter.gp_flags unless @current_entry.directory?
+        @current_entry = nil
+        @compressor = ::Zip::NullCompressor.instance
+      rescue StandardError
+        @failed = true
+        raise
+      end
     end
 
     def init_next_entry(entry)
       finalize_current_entry
       check_duplicate_name(entry, 'put_next_entry')
-      @encrypter.prepare_entry(entry)
-      @cdir << entry
-      entry.write_local_entry(@output_stream, suppress_extra_fields: @suppress_extra_fields)
-      @encrypter.reset!
-      @output_stream << @encrypter.header(entry.mtime) unless entry.directory?
-      @compressor = get_compressor(entry)
+      begin
+        @encrypter.prepare_entry(entry)
+        @cdir << entry
+        entry.write_local_entry(@output_stream, suppress_extra_fields: @suppress_extra_fields)
+        @encrypter.reset!
+        @output_stream << @encrypter.header(entry.mtime) unless entry.directory?
+        @compressor = get_compressor(entry)
+      rescue StandardError
+        @failed = true
+        raise
+      end
     end
 
     def check_duplicate_name(entry, proc_name)
@@ -209,6 +222,15 @@ module Zip
       @output_stream.pos = pos
     end
 
+    def write_central_directory
+      @cdir.write_to_stream(
+        @output_stream, suppress_extra_fields: @suppress_extra_fields
+      )
+    rescue StandardError
+      @failed = true
+      raise
+    end
+
     protected
 
     def finish # :nodoc:
@@ -221,6 +243,9 @@ module Zip
     def <<(data)
       @compressor << data
       self
+    rescue StandardError
+      @failed = true
+      raise
     end
   end
 end

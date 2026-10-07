@@ -12,6 +12,7 @@ module Zip
       # Ensures that integrity is only checked once,
       # even if read is called multiple times after the input has finished.
       @integrity_verified = false
+      verify_integrity! if input_finished?
     end
 
     def read(maxlen = nil)
@@ -23,10 +24,7 @@ module Zip
         @buffer << produce_input
       end
 
-      if input_finished? && !@integrity_verified
-        @decrypter.check_integrity!(@io)
-        @integrity_verified = true
-      end
+      verify_integrity! if input_finished?
 
       @buffer.slice!(0...(maxlen || @buffer.bytesize))
     end
@@ -39,6 +37,13 @@ module Zip
 
     def input_finished?
       !@bytes_remaining.positive?
+    end
+
+    def verify_integrity!
+      return if @integrity_verified
+
+      @decrypter.check_integrity!(@io)
+      @integrity_verified = true
     end
 
     def produce_input

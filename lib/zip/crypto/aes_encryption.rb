@@ -44,14 +44,19 @@ module Zip
       STRENGTH_256_BIT => 16
     }.freeze
 
-    def initialize(password, strength)
+    def initialize(password, strength, random: SecureRandom)
       # Loaded here rather than at the top of the file so that `require 'zip'`
       # does not pull in openssl. Only AES-encrypted archives need it, and it
       # is the single largest cost of loading this library.
       require 'openssl'
 
+      unless STRENGTHS.include? strength
+        raise Error, "Unsupported encryption AES strength #{strength}"
+      end
+
       @password = password
       @strength = strength
+      @random = random
       @bits = BITS[@strength]
       @key_length = KEY_LENGTHS[@strength]
       @salt_length = SALT_LENGTHS[@strength]
@@ -125,7 +130,11 @@ module Zip
     end
 
     def reset!
-      @salt = SecureRandom.random_bytes(@salt_length)
+      @salt = @random.random_bytes(@salt_length)
+      unless @salt.bytesize == @salt_length
+        raise Error, "Random source returned #{@salt.bytesize} bytes, expected #{@salt_length}"
+      end
+
       enc_key, enc_hmac_key, @pwd_verify = derive_keys(@salt)
 
       @counter = 0
@@ -207,7 +216,20 @@ module Zip
 
     def check_integrity!(io)
       auth_code = io.read(AUTHENTICATION_CODE_LENGTH)
-      raise Error, 'Integrity fault' if @hmac.digest[0...AUTHENTICATION_CODE_LENGTH] != auth_code
+      expected_auth_code = @hmac.digest[0...AUTHENTICATION_CODE_LENGTH]
+      return if auth_code &&
+                auth_code.bytesize == AUTHENTICATION_CODE_LENGTH &&
+                secure_compare?(expected_auth_code, auth_code)
+
+      raise Error, 'Integrity fault'
+    end
+
+    private
+
+    def secure_compare?(first, second)
+      result = 0
+      first.bytes.each_with_index { |byte, index| result |= byte ^ second.getbyte(index) }
+      result.zero?
     end
   end
 end
