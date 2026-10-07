@@ -73,7 +73,12 @@ module Zip
 
     # Opens a zip archive. Pass create: true to create
     # a new archive if it doesn't exist already.
+    #
+    # Pass revision: with a Zip::RevisionReceipt (see #current_revision and
+    # #commit_append_revision) to read the archive exactly as it looked at
+    # that revision, instead of reading the latest central directory.
     def initialize(path_or_io, create: false, buffer: false,
+                   revision: nil,
                    restore_ownership: DEFAULT_RESTORE_OPTIONS[:restore_ownership],
                    restore_permissions: DEFAULT_RESTORE_OPTIONS[:restore_permissions],
                    restore_times: DEFAULT_RESTORE_OPTIONS[:restore_times],
@@ -84,7 +89,8 @@ module Zip
       @name    = path_or_io.respond_to?(:path) ? path_or_io.path : path_or_io
       @create  = create ? true : false # allow any truthy value to mean true
 
-      initialize_cdir(path_or_io, buffer: buffer)
+      self.class.recover_append_revision(@name) if !buffer && @name.kind_of?(String)
+      initialize_cdir(path_or_io, buffer: buffer, revision: revision)
 
       @restore_ownership     = restore_ownership
       @restore_permissions   = restore_permissions
@@ -97,13 +103,14 @@ module Zip
       # Similar to ::new. If a block is passed the Zip::File object is passed
       # to the block and is automatically closed afterwards, just as with
       # ruby's builtin File::open method.
-      def open(file_name, create: false,
+      def open(file_name, create: false, revision: nil,
                restore_ownership: DEFAULT_RESTORE_OPTIONS[:restore_ownership],
                restore_permissions: DEFAULT_RESTORE_OPTIONS[:restore_permissions],
                restore_times: DEFAULT_RESTORE_OPTIONS[:restore_times],
                compression_level: ::Zip.default_compression,
                suppress_extra_fields: false)
         zf = ::Zip::File.new(file_name, create:                create,
+                                        revision:              revision,
                                         restore_ownership:     restore_ownership,
                                         restore_permissions:   restore_permissions,
                                         restore_times:         restore_times,
@@ -178,6 +185,22 @@ module Zip
         else
           cdir.count_entries(path_or_io)
         end
+      end
+
+      # Rolls back an interrupted append-revision commit on the archive at
+      # +path+, using the revision journal written beside the archive when
+      # the revision started (see #commit_append_revision). If the last
+      # revision did not complete, the archive is truncated back to the
+      # confirmed length recorded in the journal; the partially written
+      # revision is discarded and the previously committed revision becomes
+      # the latest one again. Recovery decisions are made purely from the
+      # journal - the archive body is never scanned for signatures.
+      #
+      # This runs automatically when an archive is opened; call it
+      # explicitly to recover an archive without opening it. Returns
+      # :rolled_back or :complete if a journal was found, nil otherwise.
+      def recover_append_revision(path)
+        ::Zip::RevisionJournal.recover(path)
       end
 
       # Recursively adds the contents of `src_dir` to the new archive
@@ -411,6 +434,96 @@ module Zip
       initialize_cdir(@name)
     end
 
+    # Commits changes by appending a new revision to the end of the
+    # archive, instead of rewriting the whole file like #commit does.
+    # Only the entries that were added, replaced or renamed are written;
+    # unchanged entries are neither read nor recompressed - the new
+    # central directory simply keeps referencing their original local
+    # records. For a large archive with a few small changes this avoids
+    # rewriting (and re-reading) the entire file.
+    #
+    # The revision is written in a strict order - changed entry bodies,
+    # then the new central directory, then the end-of-central-directory
+    # record, then a completion marker in a journal file kept next to the
+    # archive - and each stage is flushed to disk before the next begins.
+    # The commit only reports success once the completion marker is
+    # durable. If the process crashes or the write fails part-way, the
+    # archive is rolled back to its last confirmed length from the journal
+    # (see Zip::File.recover_append_revision, which also runs automatically
+    # the next time the archive is opened).
+    #
+    # Returns a Zip::RevisionReceipt describing the new revision. Keep the
+    # receipt of a revision if you want to read that revision later:
+    #
+    # ```
+    # zip = Zip::File.new('big.zip')
+    # before = zip.current_revision
+    # zip.replace('small.txt', 'small-new.txt')
+    # zip.commit_append_revision
+    #
+    # Zip::File.open('big.zip', revision: before) do |old|
+    #   puts old.read('small.txt') # the contents as they were before
+    # end
+    # ```
+    #
+    # Deleting or replacing an entry only affects the latest central
+    # directory: the old entry bytes stay in the file and remain readable
+    # through earlier revision receipts, and the file grows with every
+    # revision. This is NOT secure deletion - if you need the old bytes
+    # gone, use #commit, which rewrites the whole archive (and thereby
+    # invalidates all earlier receipts).
+    #
+    # Append-revision commits require an existing archive on disk; they
+    # are not supported for in-memory buffers or freshly created archives
+    # (use #commit for the first write of a new archive).
+    def commit_append_revision(stage_hook: nil)
+      if name.kind_of?(StringIO)
+        raise Error, 'append-revision commit is not supported for in-memory buffers'
+      end
+      raise Error, 'append-revision commit requires an existing archive on disk' if @create
+
+      base = current_revision
+      if base.nil?
+        raise Error, 'append-revision commit requires an existing committed archive, ' \
+                     'opened at its latest revision'
+      end
+      return base unless commit_required?
+
+      if ::File.size(@name) < base.end_offset
+        raise Error, "#{@name} changed on disk since it was opened; cannot append a revision"
+      end
+
+      receipt = ::Zip::RevisionAppender.new(
+        @name, @cdir,
+        suppress_extra_fields: @suppress_extra_fields,
+        stage_hook:            stage_hook
+      ).commit
+      initialize_cdir(@name)
+      receipt
+    end
+
+    # Returns a Zip::RevisionReceipt describing the revision of the archive
+    # currently loaded in this Zip::File, or nil if the archive has not
+    # been committed to disk yet, or if the archive was opened at an older
+    # revision via the revision: keyword (in that case, keep using the
+    # receipt it was opened with). Pass the receipt to Zip::File.open via
+    # the revision: keyword to read this exact revision later, even after
+    # newer revisions have been appended.
+    def current_revision
+      return nil if @cdir.cdir_offset.nil? || @cdir.eocd_offset.nil?
+
+      ::Zip::RevisionReceipt.new(
+        path:        @name,
+        cdir_offset: @cdir.cdir_offset,
+        cdir_size:   @cdir.cdir_size,
+        entry_count: @cdir.size,
+        eocd_offset: @cdir.eocd_offset,
+        end_offset:  @cdir.eocd_offset +
+                     ::Zip::CentralDirectory::STATIC_EOCD_SIZE + comment.bytesize,
+        comment:     comment
+      )
+    end
+
     # Write buffer write changes to buffer and return
     def write_buffer(io = ::StringIO.new)
       return io unless commit_required?
@@ -514,8 +627,23 @@ module Zip
       end
     end
 
-    def initialize_cdir(path_or_io, buffer: false)
+    def initialize_cdir(path_or_io, buffer: false, revision: nil)
       @cdir = ::Zip::CentralDirectory.new
+
+      if revision
+        raise ArgumentError, 'revision: is only supported for path-based archives' if buffer
+        raise Error, "File #{@name} not found" unless ::File.size?(@name.to_s)
+
+        @create = false
+        @file_permissions = ::File.stat(@name).mode
+        ::File.open(@name, 'rb') do |f|
+          @cdir.read_from_stream_at(f,
+                                    cdir_offset: revision.cdir_offset,
+                                    entry_count: revision.entry_count,
+                                    comment:     revision.comment)
+        end
+        return
+      end
 
       if ::File.size?(@name.to_s)
         # There is a file, which exists, that is associated with this zip.

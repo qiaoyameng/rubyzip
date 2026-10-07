@@ -22,6 +22,11 @@ module Zip
 
     attr_accessor :comment
 
+    # Byte positions of the central directory and end-of-central-directory
+    # record of the revision most recently read from (or written to) a
+    # stream. Used to build Zip::RevisionReceipts.
+    attr_reader :cdir_offset, :cdir_size, :eocd_offset # :nodoc:
+
     def_delegators :@entry_set,
                    :<<, :delete, :each, :entries, :find_entry, :glob,
                    :include?, :size
@@ -39,19 +44,46 @@ module Zip
       read_central_directory_entries(io)
     end
 
+    # Reads the central directory at an explicit location, as recorded in
+    # a Zip::RevisionReceipt, instead of locating it via the
+    # end-of-central-directory record at the end of the stream. This is
+    # how older revisions of an append-only archive are read.
+    def read_from_stream_at(io, cdir_offset:, entry_count:, comment: '') # :nodoc:
+      @cdir_offset = cdir_offset
+      @size = entry_count
+      @comment = comment
+      read_central_directory_entries(io)
+    end
+
     def write_to_stream(io, suppress_extra_fields: false) # :nodoc:
-      cdir_offset = io.tell
+      cdir_offset, cdir_size = write_c_dir_entries(io, suppress_extra_fields: suppress_extra_fields)
+      write_end_records(io, cdir_offset, cdir_size)
+    end
+
+    # Writes the central directory entry records at the stream's current
+    # position and returns [cdir_offset, cdir_size].
+    def write_c_dir_entries(io, suppress_extra_fields: false) # :nodoc:
+      @cdir_offset = io.tell
       @entry_set.each do |entry|
         entry.write_c_dir_entry(io, suppress_extra_fields: suppress_extra_fields)
       end
-      eocd_offset = io.tell
-      cdir_size = eocd_offset - cdir_offset
+      @cdir_size = io.tell - @cdir_offset
+      [@cdir_offset, @cdir_size]
+    end
+
+    # Writes the (Zip64, if needed) end-of-central-directory records for a
+    # central directory of +cdir_size+ bytes written at +cdir_offset+.
+    # Returns the offset of the final end-of-central-directory record.
+    def write_end_records(io, cdir_offset, cdir_size) # :nodoc:
+      zip64_eocd_offset = io.tell
       if Zip.write_zip64_support &&
          (cdir_offset > 0xFFFFFFFF || cdir_size > 0xFFFFFFFF || @entry_set.size > 0xFFFF)
         write_64_e_o_c_d(io, cdir_offset, cdir_size)
-        write_64_eocd_locator(io, eocd_offset)
+        write_64_eocd_locator(io, zip64_eocd_offset)
       end
+      @eocd_offset = io.tell
       write_e_o_c_d(io, cdir_offset, cdir_size)
+      @eocd_offset
     end
 
     # Reads the End of Central Directory Record (and the Zip64 equivalent if
@@ -121,10 +153,10 @@ module Zip
       _number_of_disk_with_start_of_cdir,
       _total_number_of_entries_in_cdir_on_this_disk,
       @size,
-      size_in_bytes,
+      @cdir_size,
       @cdir_offset = buffer.unpack('VQ<vvVVQ<Q<Q<Q<')
 
-      validate_size!(@size, size_in_bytes)
+      validate_size!(@size, @cdir_size)
 
       zip64_extensible_data_size =
         size_of_zip64_e_o_c_d - ZIP64_STATIC_EOCD_SIZE + 12
@@ -153,15 +185,15 @@ module Zip
       number_of_disk_with_start_of_cdir,
       total_number_of_entries_in_cdir_on_this_disk,
       @size,
-      size_in_bytes,
+      @cdir_size,
       @cdir_offset,
       comment_length = buffer.unpack('VvvvvVVv')
 
       complete = !([number_of_this_disk, number_of_disk_with_start_of_cdir,
                     total_number_of_entries_in_cdir_on_this_disk, @size].any?(0xFFFF) ||
-                    size_in_bytes == 0xFFFFFFFF || @cdir_offset == 0xFFFFFFFF)
+                    @cdir_size == 0xFFFFFFFF || @cdir_offset == 0xFFFFFFFF)
 
-      validate_size!(@size, size_in_bytes) if complete
+      validate_size!(@size, @cdir_size) if complete
 
       @comment = if comment_length.positive?
                    buffer.slice(STATIC_EOCD_SIZE, comment_length)
@@ -221,6 +253,8 @@ module Zip
 
       eocd_location = data.rindex([END_OF_CD_SIG].pack('V'))
       raise Error, 'Zip end of central directory signature not found' unless eocd_location
+
+      @eocd_offset = base_location + eocd_location
 
       # Parse the EOCD and return if it is complete without Zip64 extensions.
       return if unpack_e_o_c_d(data.slice(eocd_location..-1))

@@ -102,6 +102,16 @@ module Zip
       @output_stream
     end
 
+    # Finalizes the current entry and rewrites the local headers of every
+    # entry written so far, without writing the central directory and
+    # without closing the underlying stream. Used by Zip::File's
+    # append-revision commit, which appends entry bodies to an existing
+    # archive and writes the central directory itself.
+    def finish_entries # :nodoc:
+      finalize_current_entry
+      update_local_headers
+    end
+
     # Closes the current entry and opens a new for writing.
     # +entry+ can be a ZipEntry object or a string.
     #
