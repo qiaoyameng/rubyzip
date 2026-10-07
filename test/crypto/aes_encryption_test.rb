@@ -165,4 +165,132 @@ class AESEncrypterTest < Minitest::Test
     error = assert_raises(Zip::Error) { decrypter.check_integrity!(StringIO.new(auth_code)) }
     assert_equal 'Integrity fault', error.message
   end
+
+  def test_error_messages_do_not_leak_password_or_key_material
+    secret_password = 'sup3r-s3cret-p@ssw0rd'
+    encrypter = Zip::AESEncrypter.new(secret_password, Zip::AESEncryption::STRENGTH_256_BIT)
+    encrypter.reset!
+    header = encrypter.header('ignored')
+    ciphertext = encrypter.encrypt('some secret data')
+    leftover, auth_code = split_trailer(encrypter.trailer)
+
+    wrong_password = 'wr0ng-p@ssw0rd'
+    decrypter = Zip::AESDecrypter.new(wrong_password, Zip::AESEncryption::STRENGTH_256_BIT)
+    error = assert_raises(Zip::Error) { decrypter.reset!(header) }
+    refute_includes error.message, secret_password
+    refute_includes error.message, wrong_password
+
+    decrypter = Zip::AESDecrypter.new(secret_password, Zip::AESEncryption::STRENGTH_256_BIT)
+    decrypter.reset!(header)
+    decrypter.decrypt(ciphertext + leftover)
+    tampered_auth_code = auth_code.dup
+    tampered_auth_code[0] = (tampered_auth_code.getbyte(0) ^ 0xFF).chr
+    error = assert_raises(Zip::Error) do
+      decrypter.check_integrity!(StringIO.new(tampered_auth_code))
+    end
+    refute_includes error.message, secret_password
+  end
+end
+
+# Cross-validates the encoder against the independently generated fixture
+# archives in `test/data` (produced by external tools, not by rubyzip): with
+# the salt from a fixture injected as the random source, the encoder must
+# reproduce that fixture's password verifier, ciphertext and authentication
+# code byte-for-byte. This guards against encoder/decoder pairs that share
+# a mutually consistent but format-incompatible bug.
+class AESKnownAnswerTest < Minitest::Test
+  DATA_DIR = 'test/data'
+
+  # A test-only random source that hands out predetermined bytes.
+  class FixedRandomSource
+    def initialize(bytes)
+      @bytes = bytes
+    end
+
+    def random_bytes(length)
+      raise "unexpected random_bytes(#{length})" unless @bytes.bytesize == length
+
+      @bytes
+    end
+  end
+
+  FIXTURES = [
+    ['zip-aes-128.zip', Zip::AESEncryption::STRENGTH_128_BIT],
+    ['zip-aes-256.zip', Zip::AESEncryption::STRENGTH_256_BIT]
+  ].freeze
+
+  def read_first_local_entry(path)
+    data = File.binread(path)
+    fields = data[0, 30].unpack('VvvvvvVVVvv')
+    name_length, extra_length = fields[-2..]
+    name = data[30, name_length]
+    extra = data[(30 + name_length), extra_length]
+    payload_offset = 30 + name_length + extra_length
+    {
+      gp_flags: fields[2],
+      method:   fields[3],
+      crc:      fields[6],
+      name:     name,
+      extra:    extra,
+      payload:  data[payload_offset, fields[7]]
+    }
+  end
+
+  def parse_aes_extra(extra)
+    offset = 0
+    while offset < extra.bytesize
+      header_id, size = extra[offset, 4].unpack('vv')
+      content = extra[(offset + 4), size]
+      return content.unpack('va2Cv') if header_id == 0x9901
+
+      offset += 4 + size
+    end
+    nil
+  end
+
+  FIXTURES.each do |fixture, strength|
+    define_method("test_encoder_matches_independent_fixture_#{fixture}") do
+      entry = read_first_local_entry(File.join(DATA_DIR, fixture))
+
+      # The fixture must be an AE-2, STORED entry so that the encrypted
+      # payload is exactly the (uncompressed) file content.
+      assert_equal 1, entry[:gp_flags] & 1
+      assert_equal 99, entry[:method]
+      assert_equal 0, entry[:crc]
+      vendor_version, vendor_id, enc_strength, compression = parse_aes_extra(entry[:extra])
+      assert_equal Zip::AESEncryption::VERSION_AE_2, vendor_version
+      assert_equal 'AE', vendor_id
+      assert_equal strength, enc_strength
+      assert_equal Zip::Entry::STORED, compression
+
+      salt_length = Zip::AESEncryption::SALT_LENGTHS[strength]
+      verifier_length = Zip::AESEncryption::VERIFIER_LENGTH
+      auth_length = Zip::AESEncryption::AUTHENTICATION_CODE_LENGTH
+      salt = entry[:payload][0, salt_length]
+      verifier = entry[:payload][salt_length, verifier_length]
+      ciphertext = entry[:payload][(salt_length + verifier_length)...-auth_length]
+      auth_code = entry[:payload][-auth_length..]
+      plaintext = File.binread(File.join(DATA_DIR, entry[:name]))
+      assert_equal plaintext.bytesize, ciphertext.bytesize
+
+      encrypter = Zip::AESEncrypter.new(
+        'password', strength, random: FixedRandomSource.new(salt)
+      )
+      encrypter.reset!
+      assert_equal salt + verifier, encrypter.header('ignored')
+
+      # Feed the plaintext in awkward, non-block-aligned chunks; the output
+      # must not depend on how the caller chunks its writes.
+      actual_ciphertext = +''
+      plaintext.bytes.each_slice(5) do |slice|
+        actual_ciphertext << encrypter.encrypt(slice.pack('C*'))
+      end
+      trailer = encrypter.trailer
+      actual_ciphertext << trailer[0...-auth_length]
+      actual_auth_code = trailer[-auth_length..]
+
+      assert_equal ciphertext, actual_ciphertext
+      assert_equal auth_code, actual_auth_code
+    end
+  end
 end

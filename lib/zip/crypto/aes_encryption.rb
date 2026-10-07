@@ -91,6 +91,15 @@ module Zip
   class AESEncrypter < Encrypter # :nodoc:
     include AESEncryption
 
+    # `random` must respond to `random_bytes(length)` and supplies the
+    # per-entry salt. It defaults to `SecureRandom`; inject a fixed source
+    # only in tests that need reproducible output (e.g. known-answer
+    # vectors).
+    def initialize(password, strength, random: SecureRandom)
+      super(password, strength)
+      @random = random
+    end
+
     def header(_mtime)
       @salt + @pwd_verify
     end
@@ -125,7 +134,7 @@ module Zip
     end
 
     def reset!
-      @salt = SecureRandom.random_bytes(@salt_length)
+      @salt = @random.random_bytes(@salt_length)
       enc_key, enc_hmac_key, @pwd_verify = derive_keys(@salt)
 
       @counter = 0

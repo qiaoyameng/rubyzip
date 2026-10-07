@@ -36,6 +36,57 @@ class ZipOutputStreamTest < Minitest::Test
     assert_test_zip_contents(TEST_ZIP)
   end
 
+  # An exception mid-write must not leave behind an end of central
+  # directory record that makes the partial output look like a complete,
+  # valid zip.
+  def test_open_does_not_write_end_record_when_block_raises
+    zip_name = 'test/data/generated/aborted.zip'
+    encrypter = ::Zip::AESEncrypter.new('password', ::Zip::AESEncryption::STRENGTH_256_BIT)
+
+    assert_raises(RuntimeError) do
+      ::Zip::OutputStream.open(zip_name, encrypter: encrypter) do |zos|
+        zos.put_next_entry('secret.txt')
+        zos.write 'partial data'
+        raise 'boom'
+      end
+    end
+
+    data = ::File.binread(zip_name)
+    refute_includes data, "PK\x05\x06".b # end of central directory record
+    refute_includes data, "PK\x01\x02".b # central directory entry
+  ensure
+    ::File.unlink(zip_name) if zip_name && ::File.exist?(zip_name)
+  end
+
+  # An IO that raises once more than `byte_limit` bytes have been written.
+  class LimitedIo < StringIO
+    def initialize(byte_limit)
+      super()
+      @byte_limit = byte_limit
+    end
+
+    def write(data)
+      raise IOError, 'simulated write failure' if pos + data.bytesize > @byte_limit
+
+      super
+    end
+  end
+
+  def test_write_failure_does_not_write_end_record
+    io = LimitedIo.new(128)
+    encrypter = ::Zip::AESEncrypter.new('password', ::Zip::AESEncryption::STRENGTH_256_BIT)
+
+    assert_raises(IOError) do
+      ::Zip::OutputStream.write_buffer(io, encrypter: encrypter) do |zos|
+        zos.put_next_entry('secret.txt')
+        zos.write 'x' * 1000
+      end
+    end
+
+    refute_includes io.string, "PK\x05\x06".b # end of central directory record
+    refute_includes io.string, "PK\x01\x02".b # central directory entry
+  end
+
   def test_open_without_block_forwards_options
     encrypter = ::Zip::TraditionalEncrypter.new('password')
     zos = ::Zip::OutputStream.open(

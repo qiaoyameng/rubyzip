@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'test_helper'
+require 'securerandom'
 
 class EncryptionTest < Minitest::Test
   DATA_DIR = 'test/data'
@@ -280,5 +281,172 @@ class EncryptionTest < Minitest::Test
       assert_equal 20, entry.size
       assert_equal ::File.read("#{DATA_DIR}/#{INPUT_FILE5}"), zis.read
     end
+  end
+
+  def test_aes_encrypt_all_strengths
+    content = ::File.binread("#{DATA_DIR}/#{INPUT_FILE1}")
+    password = 'swordfish'
+
+    [
+      Zip::AESEncryption::STRENGTH_128_BIT,
+      Zip::AESEncryption::STRENGTH_192_BIT,
+      Zip::AESEncryption::STRENGTH_256_BIT
+    ].each do |strength|
+      encrypted_zip = Zip::OutputStream.write_buffer(
+        StringIO.new,
+        encrypter: Zip::AESEncrypter.new(password, strength)
+      ) do |out|
+        out.put_next_entry('secret.txt')
+        out.write content
+      end
+
+      Zip::InputStream.open(
+        encrypted_zip, decrypter: Zip::AESDecrypter.new(password, strength)
+      ) do |zis|
+        entry = zis.get_next_entry
+        assert_equal content, zis.read
+        assert_equal strength, entry.extra[:aes].encryption_strength
+        assert_equal Zip::AESEncryption::VERSION_AE_2, entry.extra[:aes].vendor_version
+      end
+    end
+  end
+
+  def test_aes_encrypt_empty_entry
+    password = 'swordfish'
+    strength = Zip::AESEncryption::STRENGTH_256_BIT
+
+    encrypted_zip = Zip::OutputStream.write_buffer(
+      StringIO.new,
+      encrypter: Zip::AESEncrypter.new(password, strength)
+    ) do |out|
+      out.put_next_entry('empty.txt')
+    end
+
+    Zip::InputStream.open(
+      encrypted_zip, decrypter: Zip::AESDecrypter.new(password, strength)
+    ) do |zis|
+      entry = zis.get_next_entry
+      assert_equal 'empty.txt', entry.name
+      assert entry.aes?
+      assert_equal 0, entry.size
+      assert_equal 0, entry.crc
+      assert_equal '', zis.read
+    end
+  end
+
+  # STORED entries make the ciphertext line up exactly with the AES block
+  # boundaries; writing in 7-byte slices forces partial blocks to be
+  # buffered across `encrypt` calls.
+  def test_aes_encrypt_block_boundary_sizes
+    password = 'swordfish'
+    strength = Zip::AESEncryption::STRENGTH_256_BIT
+
+    [1, 15, 16, 17, 31, 32, 33, 255, 256, 257].each do |size|
+      content = SecureRandom.random_bytes(size)
+      encrypted_zip = Zip::OutputStream.write_buffer(
+        StringIO.new,
+        encrypter: Zip::AESEncrypter.new(password, strength)
+      ) do |out|
+        out.put_next_entry('data.bin', '', Zip::ExtraField.new, Zip::Entry::STORED)
+        content.bytes.each_slice(7) { |slice| out.write(slice.pack('C*')) }
+      end
+
+      Zip::InputStream.open(
+        encrypted_zip, decrypter: Zip::AESDecrypter.new(password, strength)
+      ) do |zis|
+        entry = zis.get_next_entry
+        assert_equal size, entry.size
+        assert_equal content, zis.read
+      end
+    end
+  end
+
+  # Sizes are unknown when the local header is first written, so they are
+  # recorded in a ZIP64 extra field (rewritten with the final values on
+  # close). The ZIP64 compressed size must include the AES salt, password
+  # verifier and authentication code, and the CRC stays zero for AE-2.
+  def test_aes_encrypt_zip64_local_header_metadata
+    password = 'swordfish'
+    strength = Zip::AESEncryption::STRENGTH_256_BIT
+    content = 'zip64 and aes ' * 100
+
+    encrypted_zip = Zip::OutputStream.write_buffer(
+      StringIO.new,
+      encrypter: Zip::AESEncrypter.new(password, strength)
+    ) do |out|
+      out.put_next_entry('data.txt')
+      out.write content
+    end
+    data = encrypted_zip.string
+
+    sig, _ver, gp_flags, method, _time, _date, crc, csize, usize,
+      name_length, extra_length = data[0, 30].unpack('VvvvvvVVVvv')
+    assert_equal 0x04034b50, sig
+    assert_equal 1, gp_flags & 1 # encrypted
+    assert_equal Zip::COMPRESSION_METHOD_AES, method
+    assert_equal 0, crc # AE-2 entries store no CRC
+    assert_equal 0xFFFFFFFF, csize
+    assert_equal 0xFFFFFFFF, usize
+
+    extras = {}
+    extra = data[30 + name_length, extra_length]
+    offset = 0
+    while offset < extra.bytesize
+      header_id, size = extra[offset, 4].unpack('vv')
+      extras[header_id] = extra[(offset + 4), size]
+      offset += 4 + size
+    end
+
+    aes_extra = extras[0x9901].unpack('va2Cv')
+    assert_equal Zip::AESEncryption::VERSION_AE_2, aes_extra[0]
+    assert_equal 'AE', aes_extra[1]
+    assert_equal strength, aes_extra[2]
+    assert_equal Zip::Entry::DEFLATED, aes_extra[3] # real compression method
+
+    payload_offset = 30 + name_length + extra_length
+    cdir_offset = data.index("PK\x01\x02", payload_offset)
+    actual_compressed_size = cdir_offset - payload_offset
+    zip64_original, zip64_compressed = extras[0x0001].unpack('Q<Q<')
+    assert_equal content.bytesize, zip64_original
+    assert_equal actual_compressed_size, zip64_compressed
+
+    Zip::InputStream.open(
+      StringIO.new(data), decrypter: Zip::AESDecrypter.new(password, strength)
+    ) do |zis|
+      entry = zis.get_next_entry
+      assert entry.zip64?
+      assert_equal content.bytesize, entry.size
+      assert_equal content, zis.read
+    end
+  end
+
+  def test_aes_tampered_authentication_code
+    password = 'swordfish'
+    strength = Zip::AESEncryption::STRENGTH_256_BIT
+
+    encrypted_zip = Zip::OutputStream.write_buffer(
+      StringIO.new,
+      encrypter: Zip::AESEncrypter.new(password, strength)
+    ) do |out|
+      out.put_next_entry('secret.txt')
+      out.write 'top secret content'
+    end
+
+    # Flip a bit in the last byte of the entry payload: the authentication
+    # code trailer, which sits just before the central directory.
+    data = encrypted_zip.string.dup
+    cdir_offset = data.index("PK\x01\x02")
+    data.setbyte(cdir_offset - 1, data.getbyte(cdir_offset - 1) ^ 0x01)
+
+    error = assert_raises(Zip::Error) do
+      Zip::InputStream.open(
+        StringIO.new(data), decrypter: Zip::AESDecrypter.new(password, strength)
+      ) do |zis|
+        zis.get_next_entry
+        zis.read
+      end
+    end
+    assert_equal 'Integrity fault', error.message
+    refute_includes error.message, password
   end
 end

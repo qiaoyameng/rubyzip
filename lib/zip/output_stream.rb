@@ -64,9 +64,16 @@ module Zip
 
         zos = new(file_name, stream: false, encrypter: encrypter,
                   suppress_extra_fields: suppress_extra_fields, **opts)
-        yield zos
-      ensure
-        zos.close if zos
+        begin
+          yield zos
+        rescue Exception # rubocop:disable Lint/RescueException
+          # Do not finalize the archive: an exception mid-write must not
+          # leave behind an end of central directory record that makes the
+          # partial output look like a complete, valid zip.
+          zos.abort
+          raise
+        end
+        zos.close
       end
 
       # Same as #open but writes to a filestream instead
@@ -83,11 +90,14 @@ module Zip
     def close
       return if @closed
 
-      finalize_current_entry
-      update_local_headers
-      @cdir.write_to_stream(@output_stream, suppress_extra_fields: @suppress_extra_fields)
-      @output_stream.close
-      @closed = true
+      begin
+        finalize_current_entry
+        update_local_headers
+        @cdir.write_to_stream(@output_stream, suppress_extra_fields: @suppress_extra_fields)
+      ensure
+        @output_stream.close
+        @closed = true
+      end
     end
 
     # Closes the stream and writes the central directory to the zip file
@@ -100,6 +110,19 @@ module Zip
       @closed = true
       @output_stream.flush
       @output_stream
+    end
+
+    # Aborts the write, closing the underlying stream without finalizing
+    # the current entry or writing the central directory. The partial
+    # output is left without an end of central directory record, so it
+    # cannot be mistaken for a complete archive.
+    def abort
+      return if @closed
+
+      @current_entry = nil
+      @compressor = ::Zip::NullCompressor.instance
+      @output_stream.close
+      @closed = true
     end
 
     # Closes the current entry and opens a new for writing.
