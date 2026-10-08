@@ -152,4 +152,78 @@ module Zip
         'uncompress it. Please use `Zip::File` instead of `Zip::InputStream`.'
     end
   end
+
+  # Error raised when a {Zip::RangeSource} is used incorrectly: when a
+  # requested range is negative, extends beyond the advertised size of the
+  # object, or otherwise cannot be satisfied.
+  class RangeError < Error
+    # Create a new RangeError describing an invalid request for the range
+    # starting at +offset+ with the given +length+, for an object of
+    # +object_size+ bytes.
+    def initialize(offset, length, object_size)
+      super()
+      @offset = offset
+      @length = length
+      @object_size = object_size
+    end
+
+    # The message returned by this error.
+    def message
+      "Invalid range (offset=#{format_part(@offset)}, " \
+        "length=#{format_part(@length)}) " \
+        "for object of size #{@object_size}."
+    end
+
+    private
+
+    def format_part(value)
+      value.nil? ? 'unspecified' : value
+    end
+  end
+
+  # Error raised when a {Zip::RangeSource} returns fewer bytes than were
+  # requested for a range that lies entirely inside the object.
+  class ShortReadError < Error
+    # Create a new ShortReadError for a request of +requested+ bytes at
+    # +offset+ that only returned +received+ bytes.
+    def initialize(offset, requested, received)
+      super()
+      @offset = offset
+      @requested = requested
+      @received = received
+    end
+
+    # The message returned by this error.
+    def message
+      "Short read at offset #{@offset}: expected #{@requested} bytes " \
+        "but got #{@received}."
+    end
+  end
+
+  # Error raised when the object backing a {Zip::RangeSource} changes
+  # identity (and therefore, potentially, content) while a zip archive is
+  # being read from it. Bytes from two different versions of the object must
+  # never be mixed, so any cached data is discarded and the current read is
+  # aborted.
+  class ObjectChangedError < Error
+    # Create a new ObjectChangedError, optionally including the expected and
+    # actual identities.
+    def initialize(expected = nil, actual = nil)
+      super()
+      @expected = expected
+      @actual = actual
+    end
+
+    # The message returned by this error.
+    def message
+      if @expected.nil? && @actual.nil?
+        return 'The range source object changed during reading. Any cached ' \
+               'data has been discarded and the read was aborted.'
+      end
+
+      'The range source object changed during reading (expected identity ' \
+        "#{@expected.inspect} but got #{@actual.inspect}). " \
+        'Any cached data has been discarded and the read was aborted.'
+    end
+  end
 end

@@ -49,6 +49,17 @@ module Zip
       @zip_fs_file.dir = @zip_fs_dir
     end
 
+    # Initializes the filesystem mappers without going through the regular
+    # archive-reading constructor. Used by the read-only, range-backed
+    # constructor, which builds its central directory itself.
+    def initialize_filesystem # :nodoc:
+      mapped_zip       = ZipFileNameMapper.new(self)
+      @zip_fs_dir      = Dir.new(mapped_zip)
+      @zip_fs_file     = File.new(mapped_zip)
+      @zip_fs_dir.file = @zip_fs_file
+      @zip_fs_file.dir = @zip_fs_dir
+    end
+
     # Returns a Zip::FileSystem::Dir which is much like ruby's builtin Dir
     # (class) object, except it works on the Zip::File on which this method is
     # invoked

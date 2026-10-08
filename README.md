@@ -271,6 +271,41 @@ end # The `InputStream` is closed at the end of the block.
 
 Any attempt to move about in a zip file opened with `Zip::InputStream` could result in the incorrect entry being accessed and/or Zlib buffer errors. If you need random access in a zip file, use `Zip::File`.
 
+### Reading one entry from a remote (range-accessible) zip
+
+When a zip archive lives somewhere that can only be read in bounded byte ranges, such as a large object in an object store addressed over HTTP, the whole file does not need to be downloaded just to read one entry. `Zip::File.open_range` takes a range source and fetches only the archive tail (to locate the end record), the central directory, and the local header and data of the entries that are actually read.
+
+Rubyzip performs no networking itself. A range source is any object that implements three methods:
+
+- `size` returning the total size of the object in bytes as an `Integer`.
+- `identity` returning a value that uniquely identifies the current content (an ETag, version id, content hash, ...). It is re-checked before each range read.
+- `read_at(offset, length)` returning exactly `length` binary bytes starting at absolute byte `offset`.
+
+Every range is validated against `size` before it is requested (negative or out-of-bounds ranges raise `Zip::RangeError`), a short response raises `Zip::ShortReadError`, and if `identity` changes during reading all cached bytes are discarded and the read aborts with `Zip::ObjectChangedError`, so bytes from two versions of the object are never mixed.
+
+```ruby
+class HttpRangeSource
+  def initialize(uri)
+    @uri = uri
+    response    = http_head(uri)
+    @size       = response.content_length
+    @identity   = response['ETag']
+  end
+
+  attr_reader :size, :identity
+
+  def read_at(offset, length)
+    http_get_range(@uri, offset, offset + length - 1).body
+  end
+end
+
+Zip::File.open_range(HttpRangeSource.new('https://example.com/big.zip')) do |zip|
+  puts zip.read('wanted.txt') # data of other, even much larger, entries is not fetched
+end
+```
+
+An archive opened this way is read-only. A small bounded cache of recently-read ranges is kept, but locating the end record is deliberately limited to the largest possible End of Central Directory record (the fixed 22-byte header plus up to a 65535-byte comment), which also makes a forged end-record signature embedded in the comment unable to masquerade as the genuine record.
+
 ### Encryption and Password Protection (experimental)
 
 Rubyzip supports reading and writing zip files with AES encryption (reading: version 3.1 and later; writing: version 3.7 and later), and reading and writing zip files with traditional zip encryption (a.k.a. "ZipCrypto"). Encryption is currently only available with the stream API, with either files or buffers, e.g.:

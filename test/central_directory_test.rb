@@ -58,6 +58,41 @@ class ZipCentralDirectoryTest < Minitest::Test
     end
   end
 
+  def test_forged_eocd_signature_in_comment_does_not_preempt_real_record
+    forged = "PK#{[0x06054b50].pack('V')}#{'X' * 10}"
+    io = ::StringIO.new(+'')
+    ::Zip::OutputStream.write_buffer(io) do |zos|
+      zos.put_next_entry('small.txt')
+      zos.write('hello')
+      zos.comment = forged
+    end
+
+    cdir = ::Zip::CentralDirectory.new
+    cdir.read_from_stream(::StringIO.new(io.string))
+
+    assert_equal(['small.txt'], cdir.entries.map(&:name))
+    assert_equal(forged, cdir.comment)
+  end
+
+  def test_locate_e_o_c_d_prefers_record_ending_at_eof
+    cdir = ::Zip::CentralDirectory.new
+    real_comment = 'real'
+    forged_comment = "#{[0x06054b50].pack('V')}junk" # a fake near-end signature
+    comment = "#{forged_comment}#{real_comment}"
+
+    io = ::StringIO.new(+'')
+    ::Zip::OutputStream.write_buffer(io) do |zos|
+      zos.put_next_entry('a.txt')
+      zos.write('a')
+      zos.comment = comment
+    end
+
+    data = io.string
+    position = cdir.send(:locate_e_o_c_d, data)
+    expected = data.bytesize - 22 - comment.bytesize
+    assert_equal(expected, position)
+  end
+
   def test_warn_file_with_too_high_number_of_entries_declared
     ::File.open('test/data/zipWithTooBigCDirSizeField.zip', 'rb') do |f|
       cdir = ::Zip::CentralDirectory.new

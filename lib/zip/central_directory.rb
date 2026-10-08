@@ -217,42 +217,87 @@ module Zip
     end
 
     def read_eocds(io) # :nodoc:
-      base_location, data = eocd_data(io)
+      _, data = eocd_data(io)
 
-      eocd_location = data.rindex([END_OF_CD_SIG].pack('V'))
+      eocd_location = locate_e_o_c_d(data)
       raise Error, 'Zip end of central directory signature not found' unless eocd_location
 
       # Parse the EOCD and return if it is complete without Zip64 extensions.
       return if unpack_e_o_c_d(data.slice(eocd_location..-1))
 
       # Need to read in the Zip64 EOCD locator and then the Zip64 EOCD.
-      zip64_eocd_locator = data.rindex([ZIP64_EOCD_LOCATOR_SIG].pack('V'), eocd_location)
+      zip64_eocd_locator = locate_zip64_eocd_locator(data, eocd_location)
       unless zip64_eocd_locator
         raise Error, 'Zip64 end of central directory locator signature expected but not found'
       end
 
-      # Do we already have the Zip64 EOCD in the data we've read?
-      zip64_eocd_location = data.rindex([ZIP64_END_OF_CD_SIG].pack('V'), zip64_eocd_locator)
+      # In the standard layout the locator sits immediately before the EOCD
+      # and the Zip64 EOCD immediately before the locator. Prefer the Zip64
+      # EOCD at that fixed position; otherwise trust the offset the locator
+      # carries and read it from there.
+      fixed_location = eocd_location - ZIP64_EOCD_LOC_SIZE - ZIP64_STATIC_EOCD_SIZE
+      if fixed_location >= 0 &&
+         data.slice(fixed_location, 4).unpack1('V') == ZIP64_END_OF_CD_SIG
+        zip64_eocd_data = data.slice(fixed_location, ZIP64_STATIC_EOCD_SIZE)
+      else
+        zip64_eocd_location = unpack_64_eocd_locator(
+          data.slice(zip64_eocd_locator, ZIP64_EOCD_LOC_SIZE)
+        )
+        raise Error, 'Zip64 end of central directory signature not found' unless zip64_eocd_location
 
-      zip64_eocd_data =
-        if zip64_eocd_location
-          # Yes.
-          data.slice(zip64_eocd_location..zip64_eocd_locator)
-        else
-          # No. Read its location from the locator and then read it in.
-          zip64_eocd_location = unpack_64_eocd_locator(
-            data.slice(zip64_eocd_locator..eocd_location)
-          )
-          unless zip64_eocd_location
-            raise Error, 'Zip64 end of central directory signature not found'
-          end
-
-          io.seek(zip64_eocd_location, IO::SEEK_SET)
-          io.read(base_location + zip64_eocd_locator - zip64_eocd_location)
+        io.seek(zip64_eocd_location, IO::SEEK_SET)
+        zip64_eocd_data = io.read(ZIP64_STATIC_EOCD_SIZE)
+        unless zip64_eocd_data &&
+               zip64_eocd_data.bytesize == ZIP64_STATIC_EOCD_SIZE &&
+               zip64_eocd_data.unpack1('V') == ZIP64_END_OF_CD_SIG
+          raise Error, 'Zip64 end of central directory signature not found'
         end
+      end
 
       # Finally, unpack the Zip64 EOCD.
       unpack_64_e_o_c_d(zip64_eocd_data)
+    end
+
+    # Locates the End of Central Directory record within `data` (the tail of
+    # an archive). A record only qualifies if its declared comment length
+    # reaches exactly to the end of `data`, which is where the real record
+    # always lives. This stops a forged EOCD signature embedded in the
+    # archive comment from preempting the genuine record. Qualifying
+    # candidates are scanned from the start, so a forged signature placed
+    # before the real record in the tail cannot win either. If nothing
+    # reaches the end (e.g. the tail was truncated), the last signature in
+    # the data is returned as a best-effort fallback.
+    def locate_e_o_c_d(data) # :nodoc:
+      signature = [END_OF_CD_SIG].pack('V')
+      positions = []
+      index = 0
+      while (found = data.index(signature, index))
+        positions << found
+        index = found + 1
+      end
+      return nil if positions.empty?
+
+      positions.find do |position|
+        next false if position + STATIC_EOCD_SIZE > data.bytesize
+
+        comment_length = data.slice(position + STATIC_EOCD_SIZE - 2, 2).unpack1('v')
+        position + STATIC_EOCD_SIZE + comment_length == data.bytesize
+      end || positions.last
+    end
+
+    # Locates the Zip64 EOCD locator, which in the standard layout sits
+    # immediately before the EOCD. A signature elsewhere in the buffered tail
+    # (e.g. inside entry data) is only accepted as a fallback if no record is
+    # present at the expected position.
+    def locate_zip64_eocd_locator(data, eocd_location) # :nodoc:
+      fixed_location = eocd_location - ZIP64_EOCD_LOC_SIZE
+      if fixed_location >= 0 &&
+         fixed_location + ZIP64_EOCD_LOC_SIZE <= data.bytesize &&
+         data.slice(fixed_location, 4).unpack1('V') == ZIP64_EOCD_LOCATOR_SIG
+        return fixed_location
+      end
+
+      data.rindex([ZIP64_EOCD_LOCATOR_SIG].pack('V'), eocd_location)
     end
 
     def eocd_data(io)

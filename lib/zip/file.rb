@@ -201,6 +201,39 @@ module Zip
           zf.extract_all(destination_directory, &block)
         end
       end
+
+      # Opens a zip archive that lives in an object which can only be read
+      # in bounded byte ranges (for example, a large object in an object
+      # store), as described by `source` (see Zip::RangeSource). Only the
+      # archive tail, the central directory, and the local header and data
+      # of entries actually read are fetched; the bytes of other entries
+      # (including very large ones) are never requested.
+      #
+      # The returned archive is read-only: {#commit} and {#close} are
+      # no-ops and no changes are ever written back through the source.
+      #
+      # If a block is passed it is yielded the opened archive and the
+      # archive is closed (a no-op for a ranged archive) when the block
+      # returns.
+      #
+      # @param source [Zip::RangeSource] an object responding to `size`,
+      #   `identity` and `read_at`.
+      #
+      # @example Read one small entry from a remote zip.
+      #   Zip::File.open_range(http_range_source) do |zip|
+      #     puts zip.read('report.csv')
+      #   end
+      def open_range(source)
+        zf = allocate
+        zf.send(:initialize_from_range, source)
+        return zf unless block_given?
+
+        begin
+          yield zf
+        ensure
+          zf.close
+        end
+      end
     end
 
     # Returns an input stream to the specified entry. If a block is passed
@@ -211,10 +244,19 @@ module Zip
     # Zip.allow_duplicate_entry_names is on and more than one entry shares
     # that name, the first matching entry is used. Pass the specific
     # Zip::Entry (e.g. from #find_entry) to target a particular duplicate.
-    def get_input_stream(entry, &a_proc)
+    #
+    # Pass +decrypter:+ to read an encrypted entry (see the encryption
+    # section of the README).
+    def get_input_stream(entry, decrypter: nil, &a_proc)
       target = entry.kind_of?(Entry) ? entry : get_entry(entry)
       target = target.first if target.kind_of?(Array)
-      target.get_input_stream(&a_proc)
+      return open_ranged_entry(target, decrypter: decrypter, &a_proc) if @range_reader
+
+      if decrypter
+        target.get_input_stream(decrypter: decrypter, &a_proc)
+      else
+        target.get_input_stream(&a_proc)
+      end
     end
 
     # Returns an output stream to the specified entry. If entry is not an instance
@@ -396,6 +438,8 @@ module Zip
     # Commits changes that has been made since the previous commit to
     # the zip archive.
     def commit
+      return if @range_reader # A range-backed archive is read-only.
+
       return if name.kind_of?(StringIO) || !commit_required?
 
       on_success_replace do |tmp_file|
@@ -423,6 +467,8 @@ module Zip
 
     # Closes the zip file committing any changes that has been made.
     def close
+      return if @range_reader # Nothing to flush for a read-only range archive.
+
       commit
     end
 
@@ -474,6 +520,44 @@ module Zip
     end
 
     private
+
+    def initialize_from_range(source)
+      @range_reader = ::Zip::RangeReader.new(source)
+      @cdir = CentralDirectory.new(@range_reader.entry_set, @range_reader.comment)
+
+      # Initialise the FileSystem adapter mappers too, when
+      # `zip/filesystem` has been required (it prepends/overrides this
+      # method). Without this a ranged archive's `file` and `dir` accessors
+      # would be nil.
+      initialize_filesystem if respond_to?(:initialize_filesystem, true)
+
+      @name = nil
+      @create = false
+      @restore_ownership     = DEFAULT_RESTORE_OPTIONS[:restore_ownership]
+      @restore_permissions   = DEFAULT_RESTORE_OPTIONS[:restore_permissions]
+      @restore_times         = DEFAULT_RESTORE_OPTIONS[:restore_times]
+      @compression_level     = ::Zip.default_compression
+      @suppress_extra_fields = false
+
+      self
+    end
+
+    def open_ranged_entry(entry, decrypter: nil, &a_proc)
+      if entry.ftype == :directory
+        yield ::Zip::NullInputStream if a_proc
+        return ::Zip::NullInputStream
+      end
+
+      apply_restore_options(entry)
+      zis = @range_reader.open_entry(entry, decrypter: decrypter)
+      return zis unless a_proc
+
+      begin
+        yield zis
+      ensure
+        zis.close
+      end
+    end
 
     def apply_restore_options(entry)
       entry.restore_ownership   = @restore_ownership
