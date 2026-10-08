@@ -51,15 +51,21 @@ module Zip
     #
     # @param context [String||IO||StringIO] file path or IO/StringIO object
     # @param offset [Integer] offset in the IO/StringIO
+    # @param data_limit [Integer, nil] when given, reads of entry data are
+    #   clamped to this many bytes after the local header. This prevents a
+    #   decompressor from reading past the selected entry into following
+    #   entries, which matters when reading a single member of a large
+    #   remote archive.
     # This method also accepts the standard IO encoding options:
     # `external_encoding:`, `internal_encoding:` and `encoding:`.
-    def initialize(context, offset: 0, decrypter: nil, **opts)
+    def initialize(context, offset: 0, decrypter: nil, data_limit: nil, **opts)
       super(**opts)
       @archive_io = get_io(context, offset)
       @decompressor = ::Zip::NullDecompressor
       @decrypter = decrypter
       @current_entry = nil
       @complete_entry = nil
+      @data_limit = data_limit
     end
 
     # Close this InputStream. All further IO will raise an IOError.
@@ -127,8 +133,9 @@ module Zip
       # Same as #initialize but if a block is passed the opened
       # stream is passed to the block and closed when the block
       # returns.
-      def open(filename_or_io, offset: 0, decrypter: nil, **opts)
-        zio = new(filename_or_io, offset: offset, decrypter: decrypter, **opts)
+      def open(filename_or_io, offset: 0, decrypter: nil, data_limit: nil, **opts)
+        zio = new(filename_or_io, offset: offset, decrypter: decrypter,
+                             data_limit: data_limit, **opts)
         return zio unless block_given?
 
         begin
@@ -171,6 +178,10 @@ module Zip
              raise Error, 'A password is required to decode this zip file.' if @decrypter.nil?
 
              get_decrypted_io
+           elsif @data_limit
+             # Restrict reads to this entry's compressed bytes so the
+             # decompressor cannot overshoot into following entries.
+             ::Zip::IOExtras::LimitedReadIo.new(@archive_io, @data_limit)
            else
              @archive_io
            end
@@ -195,7 +206,16 @@ module Zip
         compressed_size -= ::Zip::AESEncryption::AUTHENTICATION_CODE_LENGTH
       end
 
-      ::Zip::DecryptedIo.new(@archive_io, @decrypter, compressed_size)
+      data_io = @archive_io
+      if @data_limit
+        # The decryption header was read above unrestricted; bound the
+        # encrypted payload (including the AES authentication code) to this
+        # entry so nothing after it can be read.
+        data_io = ::Zip::IOExtras::LimitedReadIo.new(
+          @archive_io, @data_limit - @decrypter.header_bytesize
+        )
+      end
+      ::Zip::DecryptedIo.new(data_io, @decrypter, compressed_size)
     end
 
     def get_decompressor(io) # :nodoc:

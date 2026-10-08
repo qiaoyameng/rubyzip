@@ -166,6 +166,37 @@ module Zip
         end
       end
 
+      # Opens a zip archive stored in an object that only supports ranged
+      # reads (see Zip::RangeSource), such as a large object in remote
+      # storage. This never downloads the whole object: it reads only the
+      # end-of-central-directory record, the central directory, and then
+      # whichever single member is requested. The caller is responsible for
+      # the underlying HTTP requests; +range_source+ is never closed.
+      #
+      # The archive is opened read-only. If a block is passed it is yielded
+      # the Zip::File and the range access is released afterwards.
+      #
+      # @param range_source [RangeSource]
+      # @param cache_size [Integer] number of fetched ranges to cache
+      #
+      # @example
+      #   Zip::File.open_from_range(source) do |zip_file|
+      #     puts zip_file.read('small-member.txt')
+      #   end
+      def open_from_range(range_source, cache_size: RangeIO::DEFAULT_CACHE_SIZE)
+        range_io = RangeIO.new(range_source, cache_size: cache_size)
+        zf = allocate
+        zf.send(:initialize_from_range, range_io)
+
+        return zf unless block_given?
+
+        begin
+          yield zf
+        ensure
+          zf.close
+        end
+      end
+
       # Count the entries in a zip archive without reading the whole set of
       # entry data into memory.
       def count_entries(path_or_io)
@@ -178,6 +209,17 @@ module Zip
         else
           cdir.count_entries(path_or_io)
         end
+      end
+
+      # As #count_entries, but for an archive behind a Zip::RangeSource.
+      # Only the bounded end-of-central-directory area is read: this is the
+      # cheapest way to learn how many entries a large remote archive
+      # contains.
+      def count_entries_from_range(range_source, cache_size: RangeIO::DEFAULT_CACHE_SIZE)
+        range_io = RangeIO.new(range_source, cache_size: cache_size)
+        ::Zip::CentralDirectory.new.count_entries_from_range(range_io)
+      ensure
+        range_io&.close
       end
 
       # Recursively adds the contents of `src_dir` to the new archive
@@ -423,6 +465,11 @@ module Zip
 
     # Closes the zip file committing any changes that has been made.
     def close
+      if @range_io
+        @range_io.close
+        return
+      end
+
       commit
     end
 
@@ -544,6 +591,20 @@ module Zip
         # everything is wrong.
         raise Error, "File #{@name} not found"
       end
+    end
+
+    def initialize_from_range(range_io)
+      @range_io = range_io
+      @name = nil
+      @create = false
+      @restore_ownership = DEFAULT_RESTORE_OPTIONS[:restore_ownership]
+      @restore_permissions = DEFAULT_RESTORE_OPTIONS[:restore_permissions]
+      @restore_times = DEFAULT_RESTORE_OPTIONS[:restore_times]
+      @compression_level = ::Zip.default_compression
+      @suppress_extra_fields = false
+
+      @cdir = ::Zip::CentralDirectory.new
+      @cdir.read_from_range(range_io)
     end
 
     def check_entry_exists(entry_name, continue_on_exists_proc, proc_name)

@@ -152,4 +152,72 @@ module Zip
         'uncompress it. Please use `Zip::File` instead of `Zip::InputStream`.'
     end
   end
+
+  # Error raised when a read is requested at an invalid position in a
+  # {RangeSource}: a non-integer or negative offset/length, or a range that
+  # reaches past the end of the object.
+  class InvalidRangeError < Error; end
+
+  # Error raised when a {RangeSource#read_at} call returns fewer bytes than
+  # were requested (despite the range being in bounds). The remote object is
+  # assumed to be immutable for the lifetime of a read, so a short read
+  # means the object cannot be parsed reliably.
+  #
+  # This inherits from StandardError rather than Error so it is not silently
+  # swallowed by the content-parsing layer that rescues Zip::Error to
+  # recover from corrupt entries: a transport failure must always abort the
+  # current read.
+  class ShortReadError < StandardError
+    # The offset at which the read was attempted.
+    attr_reader :offset
+
+    # The number of bytes requested.
+    attr_reader :length
+
+    # The number of bytes actually returned.
+    attr_reader :bytes_read
+
+    # Create a new ShortReadError for a read of +length+ bytes at +offset+
+    # that only returned +bytes_read+ bytes.
+    def initialize(offset, length, bytes_read)
+      super()
+      @offset = offset
+      @length = length
+      @bytes_read = bytes_read
+    end
+
+    # The message returned by this error.
+    def message
+      "Short read from range source at offset #{@offset}: expected " \
+        "#{@length} bytes but got #{@bytes_read}"
+    end
+  end
+
+  # Error raised when the object backing a {RangeSource} changes (its
+  # identity differs from the one the archive was opened with) while a read
+  # is in progress. The current read is aborted so that bytes from two
+  # different versions of the object are never mixed together. See
+  # ShortReadError for why this inherits from StandardError rather than
+  # Error.
+  class ObjectChangedError < StandardError
+    # The identity the archive was opened with.
+    attr_reader :expected_identity
+
+    # The identity observed on the most recent read.
+    attr_reader :actual_identity
+
+    # Create a new ObjectChangedError.
+    def initialize(expected_identity, actual_identity)
+      super()
+      @expected_identity = expected_identity
+      @actual_identity = actual_identity
+    end
+
+    # The message returned by this error.
+    def message
+      'The backing object changed while reading the zip archive ' \
+        "(expected identity #{@expected_identity.inspect}, " \
+        "got #{@actual_identity.inspect})"
+    end
+  end
 end

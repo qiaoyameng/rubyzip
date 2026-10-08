@@ -683,7 +683,14 @@ module Zip
           raise "unknown @file_type #{ftype}"
         end
       else
-        zis = ::Zip::InputStream.new(@zipfile, offset: local_header_offset, decrypter: decrypter)
+        # When the archive lives behind a random-access source, bound reads
+        # to this entry's compressed data so fetching a small member can
+        # never pull in another (possibly huge) member's body.
+        data_limit = compressed_size if @zipfile.respond_to?(:total_size)
+        zis = ::Zip::InputStream.new(
+          @zipfile, offset: local_header_offset,
+                    decrypter: decrypter, data_limit: data_limit
+        )
         zis.instance_variable_set(:@complete_entry, self)
         zis.get_next_entry
         if block

@@ -39,6 +39,15 @@ module Zip
       read_central_directory_entries(io)
     end
 
+    # Reads the central directory from a randomly-readable source (a
+    # Zip::RangeSource, via a RangeIO). Only the bounded end-of-central
+    # directory area, the central directory itself and the small local
+    # headers of the entries are read; entry data is never touched.
+    def read_from_range(io)
+      read_eocds(io, total_size: io.total_size)
+      read_central_directory_entries(io)
+    end
+
     def write_to_stream(io, suppress_extra_fields: false) # :nodoc:
       cdir_offset = io.tell
       @entry_set.each do |entry|
@@ -60,6 +69,12 @@ module Zip
     # very quick entry count.
     def count_entries(io)
       read_eocds(io)
+      @size
+    end
+
+    # As #count_entries, but for a Zip::RangeSource-backed IO.
+    def count_entries_from_range(io)
+      read_eocds(io, total_size: io.total_size)
       @size
     end
 
@@ -181,7 +196,11 @@ module Zip
       rescue Errno::EINVAL
         eof = true
       end
-      raise Error, 'Zip consistency problem while reading central directory entry' if eof || io.eof?
+      if eof || io.eof? ||
+         (io.respond_to?(:total_size) &&
+          @cdir_offset + CDIR_ENTRY_STATIC_HEADER_LENGTH > io.total_size)
+        raise Error, 'Zip central directory offset is invalid or past the end of the file'
+      end
 
       @entry_set = EntrySet.new
       @size.times do
@@ -216,11 +235,17 @@ module Zip
       io.read(e_len)
     end
 
-    def read_eocds(io) # :nodoc:
-      base_location, data = eocd_data(io)
+    def read_eocds(io, total_size: nil) # :nodoc:
+      base_location, data = eocd_data(io, total_size)
 
-      eocd_location = data.rindex([END_OF_CD_SIG].pack('V'))
-      raise Error, 'Zip end of central directory signature not found' unless eocd_location
+      # Locate the real End of Central Directory record by scanning the tail
+      # forwards and taking the first signature whose declared comment runs
+      # exactly to the end of the object. A forged signature placed inside a
+      # file comment (or anywhere else before the real record) cannot win,
+      # because the real record always appears first among records that
+      # reach the end of the file. Scanning backwards with rindex would pick
+      # the forged one whenever it follows the real signature.
+      eocd_location = locate_eocd(data, total_size, base_location)
 
       # Parse the EOCD and return if it is complete without Zip64 extensions.
       return if unpack_e_o_c_d(data.slice(eocd_location..-1))
@@ -247,15 +272,70 @@ module Zip
             raise Error, 'Zip64 end of central directory signature not found'
           end
 
-          io.seek(zip64_eocd_location, IO::SEEK_SET)
-          io.read(base_location + zip64_eocd_locator - zip64_eocd_location)
+          read_zip64_eocd(io, zip64_eocd_location,
+                          base_location + zip64_eocd_locator, total_size)
         end
 
       # Finally, unpack the Zip64 EOCD.
       unpack_64_e_o_c_d(zip64_eocd_data)
     end
 
-    def eocd_data(io)
+    def locate_eocd(data, total_size, base_location)
+      signature = [END_OF_CD_SIG].pack('V')
+      search_from = 0
+      object_end = total_size || (base_location + data.bytesize)
+
+      while (location = data.index(signature, search_from))
+        return location if eocd_reaches_end?(data, location, base_location, object_end)
+
+        search_from = location + signature.bytesize
+      end
+
+      raise Error, 'Zip end of central directory signature not found'
+    end
+
+    # True when the signature at +location+ is the complete static EOCD
+    # header and its declared comment runs exactly to the end of the object.
+    def eocd_reaches_end?(data, location, base_location, object_end)
+      return false if location + STATIC_EOCD_SIZE > data.bytesize
+
+      comment_length = data.slice(location + STATIC_EOCD_SIZE - 2, 2).unpack1('v')
+      base_location + location + STATIC_EOCD_SIZE + comment_length == object_end
+    end
+
+    def read_zip64_eocd(io, offset, end_offset, total_size)
+      length = end_offset - offset
+      if total_size
+        # Range-backed IO: validate the parsed offset strictly against the
+        # object before issuing the read.
+        validate_zip64_eocd_range!(offset, length, total_size)
+      end
+      io.seek(offset, IO::SEEK_SET)
+      io.read(length)
+    end
+
+    def validate_zip64_eocd_range!(offset, length, total_size)
+      valid = offset.kind_of?(Integer) && length.kind_of?(Integer) &&
+              !offset.negative? && !length.negative? &&
+              offset + length <= total_size
+      return if valid
+
+      raise InvalidRangeError,
+            'invalid Zip64 end of central directory location ' \
+            "(offset #{offset}, length #{length}, object size #{total_size})"
+    end
+
+    def eocd_data(io, total_size = nil)
+      if total_size
+        # Random-access source: read a bounded tail only, capped by the
+        # object's known length. The tail never exceeds MAX_END_OF_CD_SIZE.
+        raise Error, 'Zip end of central directory signature not found' if total_size.zero?
+
+        base_location = [0, total_size - MAX_END_OF_CD_SIZE].max
+        io.seek(base_location, IO::SEEK_SET)
+        return [base_location, io.read(total_size - base_location)]
+      end
+
       begin
         io.seek(-MAX_END_OF_CD_SIZE, IO::SEEK_END)
       rescue Errno::EINVAL
